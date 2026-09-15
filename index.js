@@ -1,33 +1,65 @@
 import http from 'http';
+import { Readable, PassThrough } from 'stream';
 import { Client, GatewayIntentBits } from 'discord.js';
 import {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
-  StreamType
+  StreamType,
+  EndBehaviorType,
 } from '@discordjs/voice';
 import prism from 'prism-media';
-import pathToFfmpeg from 'ffmpeg-static';
 import WebSocket from 'ws';
-import { PassThrough } from 'stream';
-
-// FFmpegのパスを prism-media に認識させる
-process.env.FFMPEG_PATH = pathToFfmpeg;
 
 // ==========================================
-// 1. Render用 ダミーHTTPサーバー（スリープ・エラー防止）
+// 1. Render用 ダミーHTTPサーバー
 // ==========================================
 const port = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Gemini Voice Bot is alive!\n');
+  res.end('Gemini Voice Bot is running!\n');
 }).listen(port, () => {
   console.log(`🌐 HTTP Server listening on port ${port}`);
 });
 
 // ==========================================
-// 2. Discord クライアント設定
+// 2. 超高速・低遅延リサンプリング関数（純JS実装）
+// ==========================================
+// 48kHz Stereo (Discord) ➔ 16kHz Mono (Gemini) : 3分の1に間引き & モノラル化
+function downsample48kStereoTo16kMono(buffer) {
+  const outSamples = Math.floor(buffer.length / 12); // 1サンプルあたり4バイト(左右2ch) * 3サンプル = 12バイト
+  const outBuffer = Buffer.alloc(outSamples * 2);
+  for (let i = 0; i < outSamples; i++) {
+    const inOffset = i * 12;
+    const left = buffer.readInt16LE(inOffset);
+    const right = buffer.readInt16LE(inOffset + 2);
+    const mono = Math.round((left + right) / 2);
+    outBuffer.writeInt16LE(mono, i * 2);
+  }
+  return outBuffer;
+}
+
+// 24kHz Mono (Gemini) ➔ 48kHz Stereo (Discord) : 2倍補間 & ステレオ複製
+function upsample24kMonoTo48kStereo(buffer) {
+  const inSamples = Math.floor(buffer.length / 2);
+  const outBuffer = Buffer.alloc(inSamples * 8); // 24k->48k(2倍) * 2ch(2倍) * 2byte = 8倍
+  let outOffset = 0;
+  for (let i = 0; i < inSamples; i++) {
+    const sample = buffer.readInt16LE(i * 2);
+    // 時刻 t: Left, Right
+    outBuffer.writeInt16LE(sample, outOffset);
+    outBuffer.writeInt16LE(sample, outOffset + 2);
+    // 時刻 t+1: Left, Right
+    outBuffer.writeInt16LE(sample, outOffset + 4);
+    outBuffer.writeInt16LE(sample, outOffset + 6);
+    outOffset += 8;
+  }
+  return outBuffer;
+}
+
+// ==========================================
+// 3. Discord クライアント設定
 // ==========================================
 const client = new Client({
   intents: [
@@ -40,7 +72,7 @@ const client = new Client({
 
 let geminiWs = null;
 let audioPlayer = null;
-let currentAudioStream = null;
+let playStream = null;
 
 client.once('ready', () => {
   console.log(`✅ ログイン成功: ${client.user.tag}`);
@@ -49,7 +81,6 @@ client.once('ready', () => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // 参加コマンド: !join
   if (message.content === '!join') {
     const channel = message.member?.voice?.channel;
     if (!channel) {
@@ -66,12 +97,14 @@ client.on('messageCreate', async (message) => {
     audioPlayer = createAudioPlayer();
     connection.subscribe(audioPlayer);
 
-    // Gemini 3.1 Flash Live への WebSocket 接続を開始
+    // 【対策1】無音Opusパケットを1度流してDiscordのUDP受信ロックを解除
+    kickstartVoiceConnection(audioPlayer);
+
+    // Geminiセッション開始
     startGeminiSession(connection, message.author.id);
-    message.reply('VCに参加したよ！話しかけてみてね。（割り込みもできるよ）');
+    message.reply('接続しました！何か話しかけてみてね！');
   }
 
-  // 退出コマンド: !leave
   if (message.content === '!leave') {
     if (geminiWs) {
       geminiWs.close();
@@ -90,17 +123,30 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// 無音パケット送信（UDP handshake トリガー）
+function kickstartVoiceConnection(player) {
+  const silenceBuffer = Buffer.from([0xf8, 0xff, 0xfe]);
+  const silenceStream = new Readable({
+    read() {
+      this.push(silenceBuffer);
+      this.push(null);
+    },
+  });
+  const resource = createAudioResource(silenceStream, { inputType: StreamType.Opus });
+  player.play(resource);
+}
+
 // ==========================================
-// 3. Gemini 3.1 Flash Live セッション管理
+// 4. Gemini 3.1 Flash Live 連携
 // ==========================================
 function startGeminiSession(connection, targetUserId) {
   const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${process.env.GEMINI_API_KEY}`;
   geminiWs = new WebSocket(url);
 
   geminiWs.on('open', () => {
-    console.log('🔗 Gemini Live API に接続成功');
+    console.log('🔗 Gemini Live API に接続しました');
 
-    // 初期セットアップメッセージの送信
+    // 初期セットアップ
     const setupMsg = {
       setup: {
         model: "models/gemini-3.1-flash-live-preview",
@@ -109,106 +155,112 @@ function startGeminiSession(connection, targetUserId) {
           speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
-                voiceName: "Aoede" // 落ち着いた自然な女性声
-              }
-            }
-          }
+                voiceName: "Aoede",
+              },
+            },
+          },
         },
         systemInstruction: {
-          parts: [{ text: "あなたはDiscordでフレンドリーに通話するAIです。短めの相槌やテンポのいい日本語で会話してください。" }]
-        }
-      }
+          parts: [{ text: "あなたはDiscordで通話する友達AIです。日本語で自然に、短めの相槌やテンポのいい言葉で会話してください。" }],
+        },
+      },
     };
     geminiWs.send(JSON.stringify(setupMsg));
 
-    // ユーザー音声の録音 & 送信パイプライン開始
+    // 音声受信パイプラインを開始
     startListeningToUser(connection.receiver, targetUserId);
   });
 
-  // Gemini から音声を受信
   geminiWs.on('message', (data) => {
     const response = JSON.parse(data.toString());
 
-    // ユーザーが割り込んだ（Barge-in）場合
+    // セットアップ完了通知
+    if (response.setupComplete) {
+      console.log('🤖 Gemini の準備が整いました！対話可能です。');
+      return;
+    }
+
+    // 割り込み検知 (Barge-in)
     if (response.serverContent?.interrupted) {
-      console.log('⚡ 割り込み検知: Botの発話を中断');
+      console.log('⚡ 割り込みを検知: Botの発話を即座に停止');
       if (audioPlayer) audioPlayer.stop();
-      if (currentAudioStream) {
-        currentAudioStream.destroy();
-        currentAudioStream = null;
+      if (playStream) {
+        playStream.destroy();
+        playStream = null;
       }
       return;
     }
 
-    // AIの音声データを受信
+    // Geminiからの音声データを受信して再生
     const parts = response.serverContent?.modelTurn?.parts;
     if (parts) {
       for (const part of parts) {
         if (part.inlineData?.data) {
-          const rawPcm = Buffer.from(part.inlineData.data, 'base64');
-          playAudioToDiscord(rawPcm);
+          const rawPcm24k = Buffer.from(part.inlineData.data, 'base64');
+          playAudioToDiscord(rawPcm24k);
         }
       }
     }
   });
 
-  geminiWs.on('error', (err) => console.error('Gemini WS エラー:', err));
-  geminiWs.on('close', () => console.log('Gemini WS 接続終了'));
+  geminiWs.on('error', (err) => console.error('❌ Gemini WS エラー:', err));
+  geminiWs.on('close', (code, reason) => {
+    console.log(`🔌 Gemini WS 接続終了 (code: ${code}, reason: ${reason})`);
+  });
 }
 
-// ユーザーの音声を 16kHz モノラル PCM に変換して Gemini に送信
+// ユーザーの音声を受信して Gemini に送信
 function startListeningToUser(receiver, userId) {
-  const opusStream = receiver.subscribe(userId);
-  const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-
-  const downsampler = new prism.FFmpeg({
-    args: [
-      '-f', 's16le', '-ar', '48000', '-ac', '2', '-i', '-',
-      '-f', 's16le', '-ar', '16000', '-ac', '1',
-      '-flush_packets', '1', '-'
-    ]
+  // 【対策2】EndBehaviorType.Manual で無音になってもストリームを維持
+  const opusStream = receiver.subscribe(userId, {
+    end: {
+      behavior: EndBehaviorType.Manual,
+    },
   });
 
-  opusStream.pipe(opusDecoder).pipe(downsampler);
+  const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+  opusStream.pipe(decoder);
 
-  downsampler.on('data', (chunk) => {
+  let sendCount = 0;
+  decoder.on('data', (pcm48kStereo) => {
     if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-      geminiWs.send(JSON.stringify({
-        realtimeInput: {
-          mediaChunks: [{
-            mimeType: "audio/pcm;rate=16000",
-            data: chunk.toString('base64')
-          }]
-        }
-      }));
+      const pcm16kMono = downsample48kStereoTo16kMono(pcm48kStereo);
+      geminiWs.send(
+        JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [
+              {
+                mimeType: 'audio/pcm;rate=16000',
+                data: pcm16kMono.toString('base64'),
+              },
+            ],
+          },
+        })
+      );
+
+      sendCount++;
+      if (sendCount % 50 === 0) {
+        console.log('🎙️ あなたの音声を Gemini に送信中...');
+      }
     }
   });
+
+  decoder.on('error', (err) => console.error('デコーダーエラー:', err));
 }
 
-// Geminiの音声 (24kHz Mono) ➔ 48kHz Stereo PCM に変換して Discord で再生
-function playAudioToDiscord(pcmBuffer) {
-  if (!currentAudioStream || currentAudioStream.destroyed) {
-    currentAudioStream = new PassThrough();
+// Gemini の音声を Discord で再生
+function playAudioToDiscord(pcm24kMono) {
+  const pcm48kStereo = upsample24kMonoTo48kStereo(pcm24kMono);
 
-    const upsampler = new prism.FFmpeg({
-      args: [
-        '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', '-',
-        '-f', 's16le', '-ar', '48000', '-ac', '2',
-        '-flush_packets', '1', '-'
-      ]
+  if (!playStream || playStream.destroyed) {
+    playStream = new PassThrough();
+    const resource = createAudioResource(playStream, {
+      inputType: StreamType.Raw,
     });
-
-    currentAudioStream.pipe(upsampler);
-
-    const resource = createAudioResource(upsampler, {
-      inputType: StreamType.Raw
-    });
-
     audioPlayer.play(resource);
   }
 
-  currentAudioStream.write(pcmBuffer);
+  playStream.write(pcm48kStereo);
 }
 
-// ログイン実行
 client.login(process.env.DISCORD_TOKEN);
