@@ -1,6 +1,6 @@
 import http from 'http';
 import { Readable, PassThrough } from 'stream';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, Events } from 'discord.js';
 import {
   joinVoiceChannel,
   createAudioPlayer,
@@ -24,11 +24,11 @@ http.createServer((req, res) => {
 });
 
 // ==========================================
-// 2. 超高速・低遅延リサンプリング関数（純JS実装）
+// 2. 超高速リサンプリング関数
 // ==========================================
-// 48kHz Stereo (Discord) ➔ 16kHz Mono (Gemini) : 3分の1に間引き & モノラル化
+// 48kHz Stereo (Discord) ➔ 16kHz Mono (Gemini)
 function downsample48kStereoTo16kMono(buffer) {
-  const outSamples = Math.floor(buffer.length / 12); // 1サンプルあたり4バイト(左右2ch) * 3サンプル = 12バイト
+  const outSamples = Math.floor(buffer.length / 12);
   const outBuffer = Buffer.alloc(outSamples * 2);
   for (let i = 0; i < outSamples; i++) {
     const inOffset = i * 12;
@@ -40,17 +40,15 @@ function downsample48kStereoTo16kMono(buffer) {
   return outBuffer;
 }
 
-// 24kHz Mono (Gemini) ➔ 48kHz Stereo (Discord) : 2倍補間 & ステレオ複製
+// 24kHz Mono (Gemini) ➔ 48kHz Stereo (Discord)
 function upsample24kMonoTo48kStereo(buffer) {
   const inSamples = Math.floor(buffer.length / 2);
-  const outBuffer = Buffer.alloc(inSamples * 8); // 24k->48k(2倍) * 2ch(2倍) * 2byte = 8倍
+  const outBuffer = Buffer.alloc(inSamples * 8);
   let outOffset = 0;
   for (let i = 0; i < inSamples; i++) {
     const sample = buffer.readInt16LE(i * 2);
-    // 時刻 t: Left, Right
     outBuffer.writeInt16LE(sample, outOffset);
     outBuffer.writeInt16LE(sample, outOffset + 2);
-    // 時刻 t+1: Left, Right
     outBuffer.writeInt16LE(sample, outOffset + 4);
     outBuffer.writeInt16LE(sample, outOffset + 6);
     outOffset += 8;
@@ -74,7 +72,8 @@ let geminiWs = null;
 let audioPlayer = null;
 let playStream = null;
 
-client.once('ready', () => {
+// 警告対策: Events.ClientReady を使用
+client.once(Events.ClientReady, () => {
   console.log(`✅ ログイン成功: ${client.user.tag}`);
 });
 
@@ -97,12 +96,12 @@ client.on('messageCreate', async (message) => {
     audioPlayer = createAudioPlayer();
     connection.subscribe(audioPlayer);
 
-    // 【対策1】無音Opusパケットを1度流してDiscordのUDP受信ロックを解除
+    // UDPロック解除用の無音パケット送信
     kickstartVoiceConnection(audioPlayer);
 
-    // Geminiセッション開始
+    // Gemini 接続 & 音声検知リスナー開始
     startGeminiSession(connection, message.author.id);
-    message.reply('接続しました！何か話しかけてみてね！');
+    message.reply('接続しました！VCで話しかけてみてね！');
   }
 
   if (message.content === '!leave') {
@@ -123,7 +122,6 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// 無音パケット送信（UDP handshake トリガー）
 function kickstartVoiceConnection(player) {
   const silenceBuffer = Buffer.from([0xf8, 0xff, 0xfe]);
   const silenceStream = new Readable({
@@ -146,7 +144,6 @@ function startGeminiSession(connection, targetUserId) {
   geminiWs.on('open', () => {
     console.log('🔗 Gemini Live API に接続しました');
 
-    // 初期セットアップ
     const setupMsg = {
       setup: {
         model: "models/gemini-3.1-flash-live-preview",
@@ -161,26 +158,25 @@ function startGeminiSession(connection, targetUserId) {
           },
         },
         systemInstruction: {
-          parts: [{ text: "あなたはDiscordで通話する友達AIです。日本語で自然に、短めの相槌やテンポのいい言葉で会話してください。" }],
+          parts: [{ text: "あなたはDiscordでフレンドリーに通話するAIです。日本語で自然に、短めの相槌やテンポのいい言葉で会話してください。" }],
         },
       },
     };
     geminiWs.send(JSON.stringify(setupMsg));
 
-    // 音声受信パイプラインを開始
-    startListeningToUser(connection.receiver, targetUserId);
+    // 【重要】ユーザーが喋り始めたイベントを監視
+    setupSpeakingListener(connection.receiver, targetUserId);
   });
 
   geminiWs.on('message', (data) => {
     const response = JSON.parse(data.toString());
 
-    // セットアップ完了通知
     if (response.setupComplete) {
       console.log('🤖 Gemini の準備が整いました！対話可能です。');
       return;
     }
 
-    // 割り込み検知 (Barge-in)
+    // 割り込み検知
     if (response.serverContent?.interrupted) {
       console.log('⚡ 割り込みを検知: Botの発話を即座に停止');
       if (audioPlayer) audioPlayer.stop();
@@ -191,7 +187,7 @@ function startGeminiSession(connection, targetUserId) {
       return;
     }
 
-    // Geminiからの音声データを受信して再生
+    // Geminiからの音声再生
     const parts = response.serverContent?.modelTurn?.parts;
     if (parts) {
       for (const part of parts) {
@@ -209,46 +205,50 @@ function startGeminiSession(connection, targetUserId) {
   });
 }
 
-// ユーザーの音声を受信して Gemini に送信
-function startListeningToUser(receiver, userId) {
-  // 【対策2】EndBehaviorType.Manual で無音になってもストリームを維持
-  const opusStream = receiver.subscribe(userId, {
-    end: {
-      behavior: EndBehaviorType.Manual,
-    },
-  });
+// ユーザーが喋り始めた瞬間にストリームを購読する
+function setupSpeakingListener(receiver, targetUserId) {
+  receiver.speaking.on('start', (userId) => {
+    if (userId !== targetUserId) return; // 対象ユーザーのみ
 
-  const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-  opusStream.pipe(decoder);
+    console.log('🎙️ [Discord] あなたの声（発話）を検知しました！');
 
-  let sendCount = 0;
-  decoder.on('data', (pcm48kStereo) => {
-    if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-      const pcm16kMono = downsample48kStereoTo16kMono(pcm48kStereo);
-      geminiWs.send(
-        JSON.stringify({
-          realtimeInput: {
-            mediaChunks: [
-              {
-                mimeType: 'audio/pcm;rate=16000',
-                data: pcm16kMono.toString('base64'),
-              },
-            ],
-          },
-        })
-      );
+    const opusStream = receiver.subscribe(userId, {
+      end: {
+        behavior: EndBehaviorType.AfterSilence,
+        duration: 200, // 200ms無音で一旦区切る
+      },
+    });
 
-      sendCount++;
-      if (sendCount % 50 === 0) {
-        console.log('🎙️ あなたの音声を Gemini に送信中...');
+    const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+    opusStream.pipe(decoder);
+
+    decoder.on('data', (pcm48kStereo) => {
+      if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
+        const pcm16kMono = downsample48kStereoTo16kMono(pcm48kStereo);
+        geminiWs.send(
+          JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [
+                {
+                  mimeType: 'audio/pcm;rate=16000',
+                  data: pcm16kMono.toString('base64'),
+                },
+              ],
+            },
+          })
+        );
       }
-    }
-  });
+    });
 
-  decoder.on('error', (err) => console.error('デコーダーエラー:', err));
+    opusStream.on('end', () => {
+      console.log('🔇 [Discord] 発話が終了しました。Geminiの返答を待ちます。');
+    });
+
+    decoder.on('error', (err) => console.error('デコーダーエラー:', err));
+  });
 }
 
-// Gemini の音声を Discord で再生
+// 音声再生
 function playAudioToDiscord(pcm24kMono) {
   const pcm48kStereo = upsample24kMonoTo48kStereo(pcm24kMono);
 
@@ -258,6 +258,7 @@ function playAudioToDiscord(pcm24kMono) {
       inputType: StreamType.Raw,
     });
     audioPlayer.play(resource);
+    console.log('🔊 [Discord] AIが返答を話し始めました！');
   }
 
   playStream.write(pcm48kStereo);
